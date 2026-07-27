@@ -35,7 +35,6 @@ import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.util.Log
-import com.isaklab.isdrdrivers.core.DspThread
 import androidx.core.content.ContextCompat
 import com.isaklab.isdrdrivers.core.FFTProcessor
 import com.isaklab.isdrdrivers.core.SDRConfig
@@ -243,8 +242,7 @@ class RTLUSBClient(
     private val usbDispatcher = usbExecutor.asCoroutineDispatcher()
     private val scope = CoroutineScope(SupervisorJob() + usbDispatcher)
 
-    // Bulk-read loop on a dedicated thread (see DspThread).
-    private var streamThread: Thread? = null
+    private var streamJob: Job? = null
     /** USB blocks dropped because the processor fell behind (telemetry). */
     @Volatile var droppedBlocks: Long = 0L
         private set
@@ -1088,27 +1086,33 @@ class RTLUSBClient(
     @Volatile private var procThread: Thread? = null
 
     private fun startProcessor() {
-        procThread = DspThread.start("rtl-usb-proc", DspThread.PRIORITY_RADIO) {
+        procThread = Thread({
+            android.os.Process.setThreadPriority(
+                android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
             while (isConnected && !devLost) {
                 val (buf, len) = try {
                     rawReady.poll(200, java.util.concurrent.TimeUnit.MILLISECONDS) ?: continue
                 } catch (e: InterruptedException) { break }
                 try { processIQData(buf, len) } finally { rawFree.offer(buf) }
             }
-        }
+        }, "rtl-usb-proc").also { it.start() }
     }
 
     private fun startStreaming() {
         repeat(6) { rawFree.offer(ByteArray(BULK_BUFFER_SIZE)) }
         startProcessor()
-        // Audio priority on our own thread: boosting a shared IO-pool worker
-        // leaked the priority to every unrelated coroutine that landed on it.
-        streamThread = DspThread.start("rtl-usb-rx", DspThread.PRIORITY_RADIO) {
+        streamJob = CoroutineScope(Dispatchers.IO).launch {
+            // Audio priority: block delivery must not lose CPU to rendering.
+            try {
+                android.os.Process.setThreadPriority(
+                    android.os.Process.THREAD_PRIORITY_URGENT_AUDIO
+                )
+            } catch (_: Throwable) {}
             val conn = connection
             val endpoint = bulkEndpoint
             if (conn == null || endpoint == null) {
                 onConnectionStatusChanged(false, "Device not ready")
-                return@start
+                return@launch
             }
 
             var consecutiveErrors = 0
@@ -1146,9 +1150,7 @@ class RTLUSBClient(
                             break
                         }
                         /* flush the endpoint FIFO and retry */
-                        // Same serialisation as before, from a plain thread:
-                        // the USB control ops must not race the bulk reads.
-                        runBlocking(usbDispatcher) {
+                        withContext(usbDispatcher) {
                             if (isOpen) resetBuffer()
                         }
                     }
@@ -1172,8 +1174,11 @@ class RTLUSBClient(
 
     private fun stopStreamingBlocking() {
         isConnected = false
-        DspThread.stop(streamThread, joinMs = 1000)
-        streamThread = null
+        streamJob?.let {
+            it.cancel()
+            runBlocking { it.join() }
+        }
+        streamJob = null
         procThread?.interrupt()
         procThread?.join(500)
         procThread = null

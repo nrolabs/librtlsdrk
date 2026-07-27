@@ -24,7 +24,6 @@
 package com.isaklab.librtlsdrk
 
 import android.util.Log
-import com.isaklab.isdrdrivers.core.DspThread
 import com.isaklab.isdrdrivers.core.FFTProcessor
 import com.isaklab.isdrdrivers.core.SpectrumWorker
 import kotlinx.coroutines.*
@@ -68,12 +67,8 @@ class RTLTCPClient(
     private var socket: Socket? = null
     private var inputStream: DataInputStream? = null
     private var outputStream: DataOutputStream? = null
-    // Read by the receive thread as its loop guard and written by disconnect()
-    // from another thread: the write has to be visible without a lock.
-    @Volatile private var isConnected = false
-    // Its own thread (see DspThread): raising an IO-pool worker to audio
-    // priority leaked that priority to every later coroutine on it.
-    private var receiveThread: Thread? = null
+    private var isConnected = false
+    private var receiveJob: Job? = null
     private var fftProcessor: FFTProcessor? = null
     // The Welch FFT runs on its own thread: computing it inline on the receive
     // thread stalls the socket read and drops samples at high rates. The
@@ -126,13 +121,11 @@ class RTLTCPClient(
         scope.launch {
             try {
                 isConnected = false
-                // Closing the stream is what unblocks the blocking read.
+                receiveJob?.cancel()
+                spectrumWorker?.stop()
                 inputStream?.close()
                 outputStream?.close()
                 socket?.close()
-                DspThread.stop(receiveThread)
-                receiveThread = null
-                spectrumWorker?.stop()
                 onConnectionStatusChanged(false, "Disconnected")
             } catch (e: Exception) {
             }
@@ -140,9 +133,14 @@ class RTLTCPClient(
     }
 
     private fun startReceiving() {
-        // Audio priority: this loop feeds the audio pipeline and must not
-        // lose CPU to spectrum/waterfall rendering on a low-end phone.
-        receiveThread = DspThread.start("rtltcp-rx", DspThread.PRIORITY_RADIO) {
+        receiveJob = scope.launch {
+            // Audio priority: this loop feeds the audio pipeline and must not
+            // lose CPU to spectrum/waterfall rendering on a low-end phone.
+            try {
+                android.os.Process.setThreadPriority(
+                    android.os.Process.THREAD_PRIORITY_URGENT_AUDIO
+                )
+            } catch (_: Throwable) {}
             spectrumWorker?.start()
             // Reads land directly in the block accumulator at [fill]; a block
             // is converted and delivered only when full. No thread hop per
@@ -153,7 +151,7 @@ class RTLTCPClient(
             var packetsReceived = 0
             var lastLogTime = System.currentTimeMillis()
             Log.d("RTLTCPClient", "Starting data reception loop...")
-            while (isConnected) {
+            while (isConnected && !currentCoroutineContext().job.isCancelled) {
                 try {
                     val bytesRead = inputStream!!.read(buffer, fill, buffer.size - fill)
                     if (bytesRead > 0) {
