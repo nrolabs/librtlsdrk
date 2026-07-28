@@ -28,10 +28,17 @@ import android.util.Log
 /**
  * Fitipower FC0012 tuner driver.
  *
- * Faithful Kotlin port of tuner_fc0012.c from the RTL-SDR Blog fork of
- * librtlsdr, including the librtlsdr wrapper semantics (fc0012_set_freq:
- * GPIO 6 selects the V-band/U-band filter, bandwidth fixed at 6 MHz).
- * Methods return 0 on success and a negative value on failure.
+ * Faithful Kotlin port of `tuner_fc0012.c` from the RTL-SDR Blog fork of `librtlsdr`.
+ * The FC0012 is an older, less common tuner IC supporting VHF/UHF bands.
+ *
+ * Why: Maintaining legacy tuner support ensures compatibility with early terrestrial TV
+ * dongles re-purposed for SDR. The FC0012 requires specific I2C sequences for PLL
+ * setup, VCO calibration, and filter selection.
+ *
+ * This port preserves the exact wrapper semantics from `librtlsdr`, most notably in 
+ * `setFreq`, where it explicitly toggles GPIO 6 on the RTL2832U to switch between
+ * the V-band and U-band tracking filters at the 300 MHz boundary. The IF bandwidth
+ * is fixed at 6 MHz. Methods return 0 on success and a negative value on failure.
  */
 class Fc0012Tuner(private val ctx: TunerContext) : RtlTuner {
 

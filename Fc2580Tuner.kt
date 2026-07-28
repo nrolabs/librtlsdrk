@@ -25,10 +25,17 @@ package com.isaklab.librtlsdrk
 /**
  * FCI FC2580 tuner driver.
  *
- * Kotlin port of tuner_fc2580.c. The C driver ignores the RTL2832U clock and
- * uses the tuner's own 16.384 MHz crystal (at least on the Logilink VG0002A).
- * The C code accumulates FCI_SUCCESS(1)/FCI_FAIL(0) with `&=`; here that is a
- * Boolean `ok` accumulator.
+ * Faithful Kotlin port of `tuner_fc2580.c` (originally derived from the Linux kernel
+ * driver for Terratec/Logilink devices) integrated via the RTL-SDR Blog fork of `librtlsdr`.
+ *
+ * Why: The FC2580 has unique clocking and AGC requirements compared to other RTL-SDR
+ * tuners. Notably, it ignores the RTL2832U reference clock and relies on its own
+ * 16.384 MHz crystal (typical on the Logilink VG0002A). 
+ *
+ * This class implements the frequency synthesis (VCO division, fractional N) and IF
+ * filter calibration loops required to tune the FC2580. The internal state accumulates
+ * success/failure sequentially (matching the C macro `FCI_SUCCESS`/`FCI_FAIL` logic) 
+ * to safely abort on I2C errors while ensuring register writes are ordered correctly.
  */
 class Fc2580Tuner(private val ctx: TunerContext) : RtlTuner {
 

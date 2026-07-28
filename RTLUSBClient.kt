@@ -79,13 +79,24 @@ data class RTLCommand(val cmd: Byte, val param: Int) {
 /**
  * RTL2832U USB driver.
  *
- * Kotlin port of librtlsdr.c (RTL-SDR Blog fork) on top of the Android USB host
- * API. All register access is serialized on a single-threaded dispatcher; the
- * bulk IQ stream runs on its own IO coroutine, which is safe because control
- * and bulk transfers use different endpoints.
+ * Kotlin port of librtlsdr.c (RTL-SDR Blog fork) on top of the Android USB host API.
+ * This class manages the lifecycle and hardware configuration of an RTL2832U-based SDR dongle
+ * over a raw USB bulk connection. It is responsible for enumerating the device, establishing 
+ * control endpoints for register access, and setting up a dedicated I/O coroutine to stream
+ * raw IQ samples from the bulk endpoint.
  *
- * Instances are single-use: after [disconnect] (or a failed [connect]) the
- * internal executor is shut down and a new instance must be created.
+ * Why: Safe and performant operation requires strict threading discipline. All I2C and hardware
+ * register access is serialized on a single-threaded dispatcher (`usbDispatcher`) to prevent race
+ * conditions during concurrent tuning, gain adjustment, or GPIO state changes. The IQ streaming
+ * runs asynchronously on a dedicated IO thread, ensuring that control transfers (which share the
+ * USB interface) do not block or drop bulk IQ packets.
+ *
+ * This implementation is a faithful port of the RTL-SDR Blog fork, meaning it inherits
+ * advanced hardware mitigations such as proper initialization of the R828D tuner (including
+ * RTL-SDR Blog V4 and V4L upconverter switching logic) and PLL dropout prevention (2.0V hack).
+ *
+ * State constraints: Instances are single-use. After [disconnect] (or a failed [connect]), the
+ * internal executor is shut down, and a new instance must be created to reattempt connection.
  */
 class RTLUSBClient(
     private val context: Context,

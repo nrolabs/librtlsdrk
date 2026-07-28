@@ -30,13 +30,21 @@ import kotlin.math.min
 /**
  * Elonics E4000 tuner driver.
  *
- * Faithful Kotlin port of tuner_e4k.c plus the e4000_* wrapper glue from
- * librtlsdr.c. The chip crystal (vco.fosc in the C code) is read live from
- * [TunerContext.getTunerClock], so PPM-correction changes are picked up on the
- * next tune, matching librtlsdr's behavior of refreshing e4k_s.vco.fosc.
+ * Faithful Kotlin port of `tuner_e4k.c` and the `e4000_*` wrapper glue from the RTL-SDR
+ * Blog fork of `librtlsdr`. The E4000 was the original "gold standard" RTL-SDR tuner,
+ * noted for its immense frequency range (50 MHz to 2.2 GHz, with a gap around 1.1-1.2 GHz).
  *
- * Methods return 0 on success and a negative value on failure, mirroring the
- * C code (-EINVAL is represented as [EINVAL_NEG]).
+ * Why: The E4000 architecture is highly complex, featuring three distinct IF filters (MIX,
+ * CHAN, RC), multiple independent gain stages (IF stages 1-6, LNA, Mixer), and a fractional-N
+ * PLL that must cleanly switch between 3-phase and 2-phase multipliers depending on the
+ * local oscillator frequency.
+ *
+ * This port accurately implements the PLL parameter computation (`e4k_compute_pll_params`),
+ * dynamically querying the live crystal frequency (`TunerContext.getTunerClock`) on each
+ * tune. This ensures that live PPM corrections applied at the RTL2832U level are immediately
+ * reflected in the E4000's VCO math, exactly mirroring the C library's behavior of refreshing
+ * `e4k_s.vco.fosc`. Methods return 0 on success and negative POSIX-style error codes
+ * (e.g., -EINVAL as -22) on failure.
  */
 class E4kTuner(private val ctx: TunerContext) : RtlTuner {
 

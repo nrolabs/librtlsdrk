@@ -29,10 +29,17 @@ import android.util.Log
 /**
  * Fitipower FC0013 tuner driver.
  *
- * Faithful Kotlin port of tuner_fc0013.c from the RTL-SDR Blog fork of
- * librtlsdr, including the librtlsdr wrapper semantics (bandwidth fixed at
- * 6 MHz, gain via the LNA gain table, gain mode via LNA forcing bit).
- * Methods return 0 on success and a negative value on failure.
+ * Faithful Kotlin port of `tuner_fc0013.c` from the RTL-SDR Blog fork of `librtlsdr`.
+ *
+ * Why: The FC0013 expands on the FC0012 architecture, providing wider tuning range and
+ * more granular LNA gain steps. Like the FC0012, it requires careful VCO calibration
+ * and fractional-N PLL configuration.
+ *
+ * This driver enforces the `librtlsdr` wrapper conventions: the IF bandwidth is hardcoded
+ * to 6 MHz, gain adjustments snap to a pre-calculated LNA gain lookup table, and the
+ * manual gain mode is achieved by coercing the internal AGC LNA forcing bit. The driver
+ * also implements specific tracking filter overrides for the VHF and UHF bands to
+ * optimize out-of-band rejection.
  */
 class Fc0013Tuner(private val ctx: TunerContext) : RtlTuner {
 

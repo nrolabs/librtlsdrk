@@ -23,9 +23,20 @@
 package com.isaklab.librtlsdrk
 
 /**
- * Common tuner interface, mirroring rtlsdr_tuner_iface_t in librtlsdr.c.
- * All methods return 0 on success, negative on failure. The RTL2832U driver
- * manages the I2C repeater around every call.
+ * Common tuner interface, mirroring `rtlsdr_tuner_iface_t` in `librtlsdr.c`.
+ *
+ * This interface defines the contract for all specific tuner implementations (e.g.,
+ * R820T, E4000, FC0012). It provides a hardware-agnostic API for the RTL2832U driver
+ * to command the attached RF frontend. All methods return 0 on success, or a negative
+ * error code (typically matching standard POSIX `errno` values like -EINVAL) on failure.
+ *
+ * Why: The RTL2832U chip itself is merely a demodulator and USB bridge; the actual RF
+ * reception and downconversion is handled by a companion tuner IC on the same I2C bus.
+ * The RTL2832U must enable its I2C repeater mode before communicating with the tuner,
+ * making this abstract interface strictly dependent on the caller to manage bus state.
+ *
+ * This architecture exactly mirrors the C library's structure to guarantee that ported
+ * tuning algorithms and register sequences behave identically to the RTL-SDR Blog fork.
  */
 interface RtlTuner {
     /** Human-readable name for logs/UI. */

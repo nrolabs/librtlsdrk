@@ -28,13 +28,25 @@ import android.util.Log
 /**
  * Rafael Micro R820T/R828D tuner driver.
  *
- * Faithful Kotlin port of tuner_r82xx.c from the RTL-SDR Blog fork of librtlsdr,
- * including the Blog modifications (max VCO current, 2.0V PLL dropout, and
- * RTL-SDR Blog V4 / V4L input switching with built-in upconverter support).
+ * Faithful Kotlin port of `tuner_r82xx.c` from the RTL-SDR Blog fork of `librtlsdr`.
+ * This class manages the configuration, PLL tuning, and gain staging for the Rafael Micro
+ * R820T and R828D silicon tuners over I2C.
  *
- * All I2C access goes through the callbacks supplied by the RTL2832U driver;
- * the caller is responsible for enabling the RTL2832U I2C repeater around calls.
- * Methods return 0 on success and a negative value on failure, mirroring the C code.
+ * Why: The R82xx family relies on complex tracking filters and fractional-N PLLs to tune
+ * across a wide RF range (24 MHz to 1.7 GHz natively). Configuration involves setting
+ * LNA/Mixer/VGA gains, calibrating the IF low-pass filters, and ensuring PLL lock.
+ *
+ * This implementation incorporates critical modifications from the RTL-SDR Blog fork:
+ * 1. Max VCO current and 2.0V PLL dropout mitigations to improve L-band stability.
+ * 2. Specialized input switching and 28.8 MHz upconverter support for the RTL-SDR Blog V4
+ *    and V4L dongles. This allows HF reception without resorting to direct sampling, 
+ *    automatically engaging the correct GPIOs and bypassing the internal tracking filters
+ *    when tuning below 28.8 MHz.
+ *
+ * All I2C access is routed through the `TunerContext` callbacks provided by the main
+ * RTL2832U driver. The caller is responsible for enabling the RTL2832U I2C repeater
+ * prior to any method invocation. State operations return 0 on success and a negative
+ * value on failure.
  */
 class R82xxTuner(
     private val chip: Chip,

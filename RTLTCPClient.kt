@@ -33,6 +33,25 @@ import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
+/**
+ * RTL-TCP client implementation.
+ *
+ * Kotlin port of the rtl_tcp client protocol originally defined in `rtl_tcp.c`.
+ * This class establishes a persistent TCP socket to a remote `rtl_tcp` server,
+ * issues commands (tuning, gain, sample rate) using the standard 5-byte `RTLCommand` protocol,
+ * and maintains a high-priority read loop to ingest interleaved 8-bit unsigned IQ data.
+ *
+ * Why: Decoupling the SDR hardware from the DSP processing host is crucial for distributed
+ * setups (e.g., remote antenna streaming to an Android device). The client must handle
+ * potentially erratic network behavior (short reads, stalls) without dropping the DSP thread
+ * or causing audio underruns.
+ *
+ * To maintain DSP stability, the high-priority receive thread buffers incoming packets into
+ * `BLOCK_BYTES` chunks. The conversion of unsigned 8-bit to normalized floats is done inline
+ * without garbage allocation. Spectrum FFTs are explicitly offloaded to a separate
+ * `SpectrumWorker` thread, guaranteeing that the UI/waterfall cadence does not stall the
+ * critical audio stream path.
+ */
 class RTLTCPClient(
     private val host: String,
     private val port: Int,
