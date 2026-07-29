@@ -22,6 +22,8 @@
  */
 
 package com.isaklab.librtlsdrk
+import com.isaklab.isdrdrivers.core.AntennaPowerCapable
+import com.isaklab.isdrdrivers.core.RadioClient
 
 import android.util.Log
 import com.isaklab.isdrdrivers.core.DspThread
@@ -58,7 +60,7 @@ class RTLTCPClient(
     /** (power spectrum in dB, interleaved IQ samples i0,q0,i1,q1,... in [-1,1]) */
     private val onDataReceived: (FloatArray, FloatArray) -> Unit,
     private val onConnectionStatusChanged: (Boolean, String) -> Unit
-) {
+) : RadioClient, AntennaPowerCapable {
     companion object {
         private val EMPTY_SPECTRUM = FloatArray(0)
 
@@ -105,11 +107,11 @@ class RTLTCPClient(
      * is skipped (the host has no visible spectrum consumer). Audio delivery
      * is unaffected.
      */
-    @Volatile var spectrumEnabled: Boolean = true
+    @Volatile override var spectrumEnabled: Boolean = true
     private var sampleRate: Double = 2.048e6
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    suspend fun connect(): Boolean = withContext(Dispatchers.IO) {
+    override suspend fun connect(): Boolean = withContext(Dispatchers.IO) {
         try {
             onConnectionStatusChanged(false, "Connecting...")
             socket = Socket(host, port)
@@ -141,7 +143,7 @@ class RTLTCPClient(
         }
     }
 
-    fun disconnect() {
+    override fun disconnect() {
         scope.launch {
             try {
                 isConnected = false
@@ -269,15 +271,15 @@ class RTLTCPClient(
         }
     }
 
-    fun setFrequency(frequencyHz: Long) {
+    override fun setFrequency(hz: Long) {
         spectrumWorker?.resetSmoothing()
-        sendCommand(RTLCommand(0x01.toByte(), frequencyHz.toInt()))
+        sendCommand(RTLCommand(0x01.toByte(), hz.toInt()))
     }
 
-    fun setSampleRate(sampleRateHz: Int) {
-        sampleRate = sampleRateHz.toDouble()
+    override fun setSampleRate(hz: Int) {
+        sampleRate = hz.toDouble()
         spectrumWorker?.resetSmoothing()
-        sendCommand(RTLCommand(0x02.toByte(), sampleRateHz))
+        sendCommand(RTLCommand(0x02.toByte(), hz))
     }
 
     fun setGainMode(manual: Boolean) {
@@ -291,6 +293,9 @@ class RTLTCPClient(
     fun setFrequencyCorrection(ppm: Int) {
         sendCommand(RTLCommand(0x05.toByte(), ppm))
     }
+
+    /** Contract name for the bias tee: one concept, one name across radios. */
+    override fun setAntennaPower(on: Boolean) = setBiasTee(on)
 
     fun setBiasTee(enabled: Boolean) {
         Log.i("RTLTCPClient", "Setting Bias-T: ${if (enabled) "ENABLED" else "DISABLED"}")

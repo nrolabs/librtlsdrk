@@ -22,6 +22,9 @@
  */
 
 package com.isaklab.librtlsdrk
+import com.isaklab.isdrdrivers.core.AnalogFilterCapable
+import com.isaklab.isdrdrivers.core.AntennaPowerCapable
+import com.isaklab.isdrdrivers.core.RadioClient
 
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
@@ -103,7 +106,7 @@ class RTLUSBClient(
     /** (power spectrum in dB, interleaved IQ samples i0,q0,i1,q1,... in [-1,1]) */
     private val onDataReceived: (FloatArray, FloatArray) -> Unit,
     private val onConnectionStatusChanged: (Boolean, String) -> Unit,
-) {
+) : RadioClient, AntennaPowerCapable, AnalogFilterCapable {
     companion object {
         private const val TAG = "RTLUSBClient"
         private val EMPTY_SPECTRUM = FloatArray(0)
@@ -266,7 +269,7 @@ class RTLUSBClient(
      * is skipped (the host has no visible spectrum consumer). Audio delivery
      * is unaffected.
      */
-    @Volatile var spectrumEnabled: Boolean = true
+    @Volatile override var spectrumEnabled: Boolean = true
 
     /** Coalesces rapid tuning requests from the UI. */
     @Volatile private var latestRequestedFreq = 0L
@@ -278,7 +281,7 @@ class RTLUSBClient(
 
     // ==================== Public API ====================
 
-    suspend fun connect(): Boolean = withContext(Dispatchers.IO) {
+    override suspend fun connect(): Boolean = withContext(Dispatchers.IO) {
         if (released) {
             Log.e(TAG, "connect() called on a released client; create a new instance")
             return@withContext false
@@ -331,7 +334,7 @@ class RTLUSBClient(
         }
     }
 
-    fun disconnect() {
+    override fun disconnect() {
         isConnected = false
         if (released) return
         scope.launch {
@@ -380,7 +383,14 @@ class RTLUSBClient(
         }
     }
 
-    fun setFrequency(frequencyHz: Long) = sendCommand(RTLCommand.SetFrequency(frequencyHz))
+    override fun setFrequency(hz: Long) = sendCommand(RTLCommand.SetFrequency(hz))
+
+    /**
+     * The contract's rate setter. The tuner routine of the same name is a
+     * private port detail; the host asks through the command queue, which is
+     * how every other parameter reaches this radio.
+     */
+    override fun setSampleRate(hz: Int) = sendCommand(RTLCommand.SetSampleRate(hz.toLong()))
     fun setGainMode(manual: Boolean) = sendCommand(RTLCommand.SetGainMode(manual))
     fun setGain(gainTenthsOfDb: Int) = sendCommand(RTLCommand.SetGain(gainTenthsOfDb))
     fun setDirectSamplingMode(mode: Int) = sendCommand(RTLCommand(RTLCommand.CMD_SET_DIRECT_SAMPLING, mode))
@@ -419,7 +429,7 @@ class RTLUSBClient(
             }
             RTLCommand.CMD_SET_SAMPLE_RATE -> {
                 fftProcessor?.resetSmoothing()
-                setSampleRate(command.param)
+                applyTunerSampleRate(command.param)
             }
             RTLCommand.CMD_SET_GAIN_MODE -> setTunerGainMode(command.param != 0)
             RTLCommand.CMD_SET_GAIN -> setTunerGain(command.param)
@@ -713,7 +723,7 @@ class RTLUSBClient(
 
     /** Sensible initial configuration after open, before streaming starts. */
     private fun applyStreamingDefaults() {
-        setSampleRate(SDRConfig.DEFAULT_SAMPLE_RATE_HZ)
+        applyTunerSampleRate(SDRConfig.DEFAULT_SAMPLE_RATE_HZ)
         setCenterFreq(100_000_000L)
         setTunerGainMode(false)   /* tuner AGC */
         setAgcMode(false)         /* RTL digital AGC OFF: prevents massive recovery delays and USB stalls on overload */
@@ -864,8 +874,11 @@ class RTLUSBClient(
         return r
     }
 
-    /** Port of rtlsdr_set_sample_rate. */
-    private fun setSampleRate(sampRate: Int): Int {
+    /**
+     * Program the tuner and resampler for [sampRate]. Named apart from the
+     * contract's setter, which is the queued command an outside caller uses.
+     */
+    private fun applyTunerSampleRate(sampRate: Int): Int {
         /* check if the rate is supported by the resampler */
         if (sampRate <= 225_000 || sampRate > 3_200_000 ||
             (sampRate in 300_001..900_000)
@@ -1056,6 +1069,12 @@ class RTLUSBClient(
         setGpioBit(gpio, value)
         return 0
     }
+
+    /** Contract name for the bias tee: one concept, one name across radios. */
+    override fun setAntennaPower(on: Boolean) { setBiasTee(on) }
+
+    /** Contract name for the tuner's analogue bandwidth; 0 tracks the rate. */
+    override fun setAnalogFilterHz(hz: Int) { setTunerBandwidth(hz) }
 
     fun setBiasTee(on: Boolean): Int = setBiasTeeGpio(0, on)
 
