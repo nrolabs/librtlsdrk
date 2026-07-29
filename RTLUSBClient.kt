@@ -114,7 +114,7 @@ class RTLUSBClient(
 
         private const val CTRL_TIMEOUT = 300
         private const val BULK_TIMEOUT = 500
-        private const val BULK_BUFFER_SIZE = 64 * 1024  /* multiple of 512 */
+        private const val BULK_BUFFER_SIZE = 16 * 1024  /* multiple of 512, reduced to prevent JNI GC lock stalls */
 
         private const val EEPROM_ADDR = 0xa0
         private const val EEPROM_SIZE = 256
@@ -716,7 +716,7 @@ class RTLUSBClient(
         setSampleRate(SDRConfig.DEFAULT_SAMPLE_RATE_HZ)
         setCenterFreq(100_000_000L)
         setTunerGainMode(false)   /* tuner AGC */
-        setAgcMode(true)          /* RTL digital AGC */
+        setAgcMode(false)         /* RTL digital AGC OFF: prevents massive recovery delays and USB stalls on overload */
         resetBuffer()
     }
 
@@ -1094,8 +1094,8 @@ class RTLUSBClient(
     // overflows and drops samples (audible as periodic buzz at 3.2 MSps —
     // the conversion+Welch-FFT used to run INLINE between reads). A tiny pool
     // of buffers is recycled so neither side allocates per block.
-    private val rawFree = java.util.concurrent.ArrayBlockingQueue<ByteArray>(6)
-    private val rawReady = java.util.concurrent.ArrayBlockingQueue<Pair<ByteArray, Int>>(6)
+    private val rawFree = java.util.concurrent.ArrayBlockingQueue<ByteArray>(24)
+    private val rawReady = java.util.concurrent.ArrayBlockingQueue<Pair<ByteArray, Int>>(24)
     @Volatile private var procThread: Thread? = null
 
     private fun startProcessor() {
@@ -1110,7 +1110,7 @@ class RTLUSBClient(
     }
 
     private fun startStreaming() {
-        repeat(6) { rawFree.offer(ByteArray(BULK_BUFFER_SIZE)) }
+        repeat(24) { rawFree.offer(ByteArray(BULK_BUFFER_SIZE)) }
         startProcessor()
         // Audio priority on our own thread: boosting a shared IO-pool worker
         // leaked the priority to every unrelated coroutine that landed on it.
