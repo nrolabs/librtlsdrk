@@ -275,6 +275,7 @@ class RTLUSBClient(
     @Volatile private var latestRequestedFreq = 0L
 
     private var permissionReceiver: BroadcastReceiver? = null
+    private var detachReceiver: BroadcastReceiver? = null
     @Volatile private var pendingPermission: kotlinx.coroutines.CancellableContinuation<Boolean>? = null
     @Volatile private var released = false
     private val actionUsbPermission = "${context.packageName}.USB_PERMISSION"
@@ -309,6 +310,7 @@ class RTLUSBClient(
             }
 
             usbDevice = device
+            registerDetachReceiver(device)
             onConnectionStatusChanged(false, "Opening device...")
 
             val opened = withContext(usbDispatcher) { open() }
@@ -357,6 +359,7 @@ class RTLUSBClient(
             pendingPermission = null
             if (it.isActive) it.resume(false)
         }
+        unregisterDetachReceiver()
         unregisterPermissionReceiver()
         scope.cancel()
         usbExecutor.shutdown()
@@ -487,6 +490,58 @@ class RTLUSBClient(
             }
         }
 
+    // ==================== Hot-unplug detection ====================
+
+    /**
+     * Immediate hot-unplug detection. Without it, a pulled cable is only
+     * noticed after 10 consecutive bulkTransfer timeouts (~5 s of the UI
+     * showing "connected"). The system detach broadcast fires the moment the
+     * kernel drops the device; on a match for OUR device it takes the same
+     * devLost -> close()/release() path as the bulk-error detector, so both
+     * detectors converge on one teardown (guarded by devLost/released).
+     */
+    private fun registerDetachReceiver(device: UsbDevice) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context, intent: Intent) {
+                if (intent.action != UsbManager.ACTION_USB_DEVICE_DETACHED) return
+                @Suppress("DEPRECATION")
+                val detached: UsbDevice? = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+                if (detached == null || detached.deviceName != device.deviceName) return
+                if (devLost || released) return
+                Log.e(TAG, "USB device detached, device lost")
+                devLost = true
+                isConnected = false
+                onConnectionStatusChanged(false, "Device lost")
+                scope.launch {
+                    try {
+                        close()
+                    } finally {
+                        release()
+                    }
+                }
+            }
+        }
+        detachReceiver = receiver
+        /* Protected system broadcast: only the OS can send it, so an exported
+         * receiver is safe — and it must be exported to receive an implicit
+         * system broadcast on modern Android. */
+        ContextCompat.registerReceiver(
+            context, receiver, IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED),
+            ContextCompat.RECEIVER_EXPORTED
+        )
+    }
+
+    private fun unregisterDetachReceiver() {
+        detachReceiver?.let {
+            try {
+                context.unregisterReceiver(it)
+            } catch (_: Exception) {
+                /* already unregistered */
+            }
+            detachReceiver = null
+        }
+    }
+
     private fun unregisterPermissionReceiver() {
         permissionReceiver?.let {
             try {
@@ -572,6 +627,7 @@ class RTLUSBClient(
         bulkEndpoint = null
         tuner = null
         tunerType = Tuner.UNKNOWN
+        unregisterDetachReceiver()
         unregisterPermissionReceiver()
         Log.i(TAG, "Device closed")
     }
