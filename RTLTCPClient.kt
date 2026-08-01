@@ -95,6 +95,10 @@ class RTLTCPClient(
     // Its own thread (see DspThread): raising an IO-pool worker to audio
     // priority leaked that priority to every later coroutine on it.
     private var receiveThread: Thread? = null
+    /** One-shot latch: the teardown of one connection runs exactly once,
+     *  whichever of the operator path and the failure path reaches it first.
+     *  Cleared when a new receive loop starts. */
+    private val teardownDone = java.util.concurrent.atomic.AtomicBoolean(false)
     private var fftProcessor: FFTProcessor? = null
     // The Welch FFT runs on its own thread: computing it inline on the receive
     // thread stalls the socket read and drops samples at high rates. The
@@ -144,26 +148,56 @@ class RTLTCPClient(
     }
 
     override fun disconnect() {
-        scope.launch {
-            try {
-                isConnected = false
-                // Closing the stream is what unblocks the blocking read.
-                inputStream?.close()
-                outputStream?.close()
-                socket?.close()
-                DspThread.stop(receiveThread)
-                receiveThread = null
-                spectrumWorker?.stop()
-                onConnectionStatusChanged(false, "Disconnected")
-            } catch (e: Exception) {
-            }
-        }
+        scope.launch { teardown("Disconnected") }
+    }
+
+    /**
+     * Closes the link and tells the host, exactly once per connection.
+     *
+     * Shared by [disconnect] and [failLink] so a failure exit releases the
+     * same resources an operator disconnect does — a link that is torn down
+     * silently leaves the socket, the FFT worker thread and the host's
+     * "connected" state behind.
+     *
+     * Never joins the receive thread from the receive thread itself: the
+     * failure path runs INSIDE that thread, and a self-join would burn the
+     * full join timeout on every failed link.
+     */
+    private fun teardown(statusMessage: String) {
+        if (!teardownDone.compareAndSet(false, true)) return
+        isConnected = false
+        val self = Thread.currentThread()
+        // Closing the stream is what unblocks the blocking read.
+        runCatching { inputStream?.close() }
+        runCatching { outputStream?.close() }
+        runCatching { socket?.close() }
+        receiveThread?.takeIf { it !== self }?.let { DspThread.stop(it) }
+        receiveThread = null
+        spectrumWorker?.stop()
+        onConnectionStatusChanged(false, statusMessage)
+    }
+
+    /**
+     * Retire the link after the receive thread died on an unhandled
+     * throwable. DspThread has already logged it at ERROR with the stack; the
+     * job here is to make the death VISIBLE and leave nothing running.
+     *
+     * Without this the thread is gone while `isConnected` and the host's
+     * "Connected" status survive: the display freezes on the last block and
+     * no reconnect is ever attempted, because as far as everyone above is
+     * concerned the radio is still streaming. A throwable raised while the
+     * teardown is already under way is that teardown closing the socket under
+     * the read, so the status text follows whichever path got here first.
+     */
+    private fun failLink() {
+        teardown(if (isConnected) "Error" else "Disconnected")
     }
 
     private fun startReceiving() {
+        teardownDone.set(false)
         // Audio priority: this loop feeds the audio pipeline and must not
         // lose CPU to spectrum/waterfall rendering on a low-end phone.
-        receiveThread = DspThread.start("rtltcp-rx", DspThread.PRIORITY_RADIO) {
+        receiveThread = DspThread.start("rtltcp-rx", DspThread.PRIORITY_RADIO, onFailure = { failLink() }) {
             spectrumWorker?.start()
             // Reads land directly in the block accumulator at [fill]; a block
             // is converted and delivered only when full. No thread hop per
@@ -191,20 +225,20 @@ class RTLTCPClient(
                         }
                     } else if (bytesRead == -1) {
                         Log.w("RTLTCPClient", "Server closed connection (EOF)")
-                        onConnectionStatusChanged(false, "Server closed")
-                        isConnected = false
+                        // Full teardown, not just a status change: leaving the
+                        // socket open and the FFT worker alive held both until
+                        // the next connect.
+                        teardown("Server closed")
                         break
                     }
                 } catch (e: java.net.SocketTimeoutException) {
                     Log.w("RTLTCPClient", "Socket timeout - no data received")
-                    onConnectionStatusChanged(false, "Timeout")
-                    isConnected = false
+                    teardown("Timeout")
                     break
                 } catch (e: Exception) {
                     if (isConnected) {
                         Log.e("RTLTCPClient", "Data reception error: ${e.javaClass.simpleName}: ${e.message}")
-                        onConnectionStatusChanged(false, "Error")
-                        isConnected = false
+                        teardown("Error")
                     }
                     break
                 }

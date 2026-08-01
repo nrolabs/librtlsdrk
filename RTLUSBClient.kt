@@ -1173,8 +1173,36 @@ class RTLUSBClient(
     private val rawReady = java.util.concurrent.ArrayBlockingQueue<Pair<ByteArray, Int>>(24)
     @Volatile private var procThread: Thread? = null
 
+    /**
+     * Retire the stream after one of the streaming threads died on an
+     * unhandled throwable. DspThread has already logged it at ERROR with the
+     * stack; this exists so the death is VISIBLE and nothing is left half
+     * running.
+     *
+     * Both threads matter, and for different reasons. The reader dying leaves
+     * the dongle's FIFO to overflow with nobody reading it. The processor
+     * dying is quieter and worse: the reader keeps transferring, [rawReady]
+     * stays full, and every block from then on is counted into
+     * [droppedBlocks] — a stream that reports "connected" and delivers
+     * nothing, forever. Either way the endpoint state is no longer known to
+     * us, so the device is dropped exactly the way a bulk-error device loss is
+     * dropped, and the host is told.
+     */
+    private fun failStream() {
+        if (!isConnected) return           // a teardown already owns the exit
+        isConnected = false
+        devLost = true
+        procThread?.interrupt()
+        onConnectionStatusChanged(false, "Stream error")
+        // Same close/release pair the bulk-error detector uses; `released`
+        // guards a second run, and it is what shuts the USB executor down, so
+        // this must not be posted through the (already cancelled) scope after
+        // it has run.
+        if (!released) scope.launch { try { close() } finally { release() } }
+    }
+
     private fun startProcessor() {
-        procThread = DspThread.start("rtl-usb-proc", DspThread.PRIORITY_RADIO) {
+        procThread = DspThread.start("rtl-usb-proc", DspThread.PRIORITY_RADIO, onFailure = { failStream() }) {
             while (isConnected && !devLost) {
                 val (buf, len) = try {
                     rawReady.poll(200, java.util.concurrent.TimeUnit.MILLISECONDS) ?: continue
@@ -1189,7 +1217,7 @@ class RTLUSBClient(
         startProcessor()
         // Audio priority on our own thread: boosting a shared IO-pool worker
         // leaked the priority to every unrelated coroutine that landed on it.
-        streamThread = DspThread.start("rtl-usb-rx", DspThread.PRIORITY_RADIO) {
+        streamThread = DspThread.start("rtl-usb-rx", DspThread.PRIORITY_RADIO, onFailure = { failStream() }) {
             val conn = connection
             val endpoint = bulkEndpoint
             if (conn == null || endpoint == null) {
@@ -1232,10 +1260,26 @@ class RTLUSBClient(
                             break
                         }
                         /* flush the endpoint FIFO and retry */
-                        // Same serialisation as before, from a plain thread:
-                        // the USB control ops must not race the bulk reads.
-                        runBlocking(usbDispatcher) {
-                            if (isOpen) resetBuffer()
+                        // Serialised on the USB dispatcher: the control ops
+                        // must not race the bulk reads.
+                        //
+                        // That dispatcher is a single-thread executor that
+                        // release() shuts down, and release() is exactly what
+                        // an unplug runs — so the reason this loop is here
+                        // (transfers failing) is also the reason the executor
+                        // may be gone by the time we submit. A rejected task
+                        // is therefore not an error to report but the unplug
+                        // arriving on this thread first: drop the device
+                        // through the same path the error counter uses.
+                        try {
+                            runBlocking(usbDispatcher) {
+                                if (isOpen) resetBuffer()
+                            }
+                        } catch (e: java.util.concurrent.RejectedExecutionException) {
+                            Log.w(TAG, "usb executor gone during FIFO reset: device released")
+                            devLost = true
+                            onConnectionStatusChanged(false, "Device lost")
+                            break
                         }
                     }
                 }
