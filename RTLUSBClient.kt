@@ -42,6 +42,7 @@ import com.isaklab.isdrdrivers.core.DspThread
 import androidx.core.content.ContextCompat
 import com.isaklab.isdrdrivers.core.FFTProcessor
 import com.isaklab.isdrdrivers.core.SDRConfig
+import com.isaklab.isdrdrivers.core.ZoomedSpectrum
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -263,6 +264,15 @@ class RTLUSBClient(
     @Volatile var droppedBlocks: Long = 0L
         private set
     private var fftProcessor: FFTProcessor? = null
+    private var zoomed: ZoomedSpectrum? = null
+
+    /**
+     * Narrow the panadapter's span before the transform; returns the
+     * decimation actually in force. With nothing open there is nothing to
+     * hold it, and the answer is an honest 1 rather than the request echoed.
+     */
+    fun setSpectrumZoom(decimation: Int, offsetHz: Long): Int =
+        zoomed?.setZoom(decimation, offsetHz.toDouble(), getSampleRate()) ?: 1
 
     /**
      * When false, IQ blocks are delivered with an empty spectrum and the FFT
@@ -323,6 +333,7 @@ class RTLUSBClient(
             withContext(usbDispatcher) { applyStreamingDefaults() }
 
             fftProcessor = FFTProcessor(SDRConfig.FFT_SIZE)
+            zoomed = ZoomedSpectrum(fftProcessor!!)
             isConnected = true
             startStreaming()
 
@@ -1337,7 +1348,7 @@ class RTLUSBClient(
         val now = System.currentTimeMillis()
         val spectrum = if (lastSpectrum == null || now - lastFftTimeMs >= fftIntervalMs) {
             lastFftTimeMs = now
-            fftProcessor?.computePowerSpectrum(iq, pairs)?.also { lastSpectrum = it }
+            zoomed?.compute(iq, pairs)?.also { lastSpectrum = it }
         } else {
             lastSpectrum
         } ?: return

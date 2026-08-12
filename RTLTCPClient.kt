@@ -112,6 +112,15 @@ class RTLTCPClient(
      * is unaffected.
      */
     @Volatile override var spectrumEnabled: Boolean = true
+
+    /**
+     * Narrow the panadapter's span before the transform; returns the
+     * decimation actually in force. With no session there is nothing to hold
+     * it, and the answer is an honest 1 rather than the request echoed back.
+     */
+    fun setSpectrumZoom(decimation: Int, offsetHz: Long): Int =
+        spectrumWorker?.setZoom(decimation, offsetHz.toDouble(), sampleRate.toDouble()) ?: 1
+
     private var sampleRate: Double = 2.048e6
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
