@@ -409,6 +409,10 @@ class RTLUSBClient(
     fun setGain(gainTenthsOfDb: Int) = sendCommand(RTLCommand.SetGain(gainTenthsOfDb))
     fun setDirectSamplingMode(mode: Int) = sendCommand(RTLCommand(RTLCommand.CMD_SET_DIRECT_SAMPLING, mode))
 
+    override fun frequencyHz(): Long = freq
+
+    override fun sampleRateHz(): Int = rate
+
     fun getCenterFrequency(): Long = freq
     fun getSampleRate(): Double = if (rate != 0) rate.toDouble() else SDRConfig.DEFAULT_SAMPLE_RATE_HZ.toDouble()
     fun getTunerGain(): Int = gain

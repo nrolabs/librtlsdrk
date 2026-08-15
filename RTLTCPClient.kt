@@ -122,6 +122,7 @@ class RTLTCPClient(
         spectrumWorker?.setZoom(decimation, offsetHz.toDouble(), sampleRate.toDouble()) ?: 1
 
     private var sampleRate: Double = 2.048e6
+    @Volatile private var freqHz = 0L
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     override suspend fun connect(): Boolean = withContext(Dispatchers.IO) {
@@ -317,7 +318,17 @@ class RTLTCPClient(
     override fun setFrequency(hz: Long) {
         spectrumWorker?.resetSmoothing()
         sendCommand(RTLCommand(0x01.toByte(), hz.toInt()))
+        freqHz = hz
     }
+
+    /**
+     * rtl_tcp has no reply channel, so the last tune put on the wire is the
+     * closest available truth; zero (= cannot say) until the first tune,
+     * because the far end powers up on its own default and never says so.
+     */
+    override fun frequencyHz(): Long = freqHz
+
+    override fun sampleRateHz(): Int = sampleRate.toInt()
 
     override fun setSampleRate(hz: Int) {
         sampleRate = hz.toDouble()
