@@ -391,6 +391,14 @@ class RTLUSBClient(
             if (!isOpen || devLost) return@launch
             try {
                 executeCommand(command)
+                // The state changed NOW, not when the command was queued:
+                // tell the host so its EV_SAMPLE_RATE / EV_FREQUENCY carry
+                // the rate and frequency in force after this command.
+                if (command.cmd == RTLCommand.CMD_SET_SAMPLE_RATE ||
+                    command.cmd == RTLCommand.CMD_SET_FREQUENCY
+                ) {
+                    stateListener?.invoke()
+                }
             } catch (e: Exception) {
                 Log.e(TAG, "Command 0x${command.cmd.toString(16)} failed", e)
             }
@@ -412,6 +420,11 @@ class RTLUSBClient(
     override fun frequencyHz(): Long = freq
 
     override fun sampleRateHz(): Int = rate
+
+    @Volatile private var stateListener: (() -> Unit)? = null
+    override fun setStateListener(listener: (() -> Unit)?) {
+        stateListener = listener
+    }
 
     fun getCenterFrequency(): Long = freq
     fun getSampleRate(): Double = if (rate != 0) rate.toDouble() else SDRConfig.DEFAULT_SAMPLE_RATE_HZ.toDouble()
