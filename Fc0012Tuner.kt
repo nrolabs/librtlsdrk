@@ -73,7 +73,7 @@ class Fc0012Tuner(private val ctx: TunerContext) : RtlTuner {
             0x04,   /* reg. 0x15: Enable LNA COMPS */
         )
 
-        private val GAINS = intArrayOf(-99, -40, 71, 179, 192)
+        internal val GAINS = intArrayOf(-99, -40, 71, 179, 192)
     }
 
     override val name: String get() = "Fitipower FC0012"

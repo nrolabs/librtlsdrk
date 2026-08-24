@@ -35,6 +35,30 @@ import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
+/** rtl_tcp's 12-byte greeting; both u32 values are network byte order. */
+internal data class RtlTcpHeader(val tunerType: Int, val tunerGainCount: Int)
+
+@Throws(IOException::class)
+internal fun readRtlTcpHeader(input: DataInputStream): RtlTcpHeader {
+    val magic = ByteArray(4)
+    input.readFully(magic)
+    val expectedMagic = byteArrayOf(
+        'R'.code.toByte(), 'T'.code.toByte(), 'L'.code.toByte(), '0'.code.toByte(),
+    )
+    if (!magic.contentEquals(expectedMagic)) {
+        throw IOException("Invalid rtl_tcp greeting")
+    }
+    // DataInputStream.readInt is already big-endian, exactly matching htonl()
+    // in rtl_tcp. Reversing these values turns tuner 5 into 0x05000000.
+    val tunerType = input.readInt()
+    val gainCount = input.readInt()
+    if (tunerType < 0) throw IOException("Invalid rtl_tcp tuner type $tunerType")
+    if (gainCount !in 0..MAX_RTL_GAIN_STEPS) {
+        throw IOException("Invalid rtl_tcp gain count $gainCount")
+    }
+    return RtlTcpHeader(tunerType, gainCount)
+}
+
 /**
  * RTL-TCP client implementation.
  *
@@ -63,6 +87,11 @@ class RTLTCPClient(
 ) : RadioClient, AntennaPowerCapable {
     companion object {
         private val EMPTY_SPECTRUM = FloatArray(0)
+        internal val SUPPORTED_SAMPLE_RATES = setOf(
+            240_000, 300_000, 960_000, 1_024_000, 1_152_000, 1_200_000,
+            1_440_000, 1_600_000, 1_800_000, 2_048_000, 2_400_000,
+            2_560_000, 2_880_000, 3_200_000,
+        )
 
         /**
          * Delivery block: bytes accumulated before one conversion+delivery.
@@ -92,6 +121,7 @@ class RTLTCPClient(
     // Read by the receive thread as its loop guard and written by disconnect()
     // from another thread: the write has to be visible without a lock.
     @Volatile private var isConnected = false
+    @Volatile private var tunerMetadata = RtlTunerInfo.unknown()
     // Its own thread (see DspThread): raising an IO-pool worker to audio
     // priority leaked that priority to every later coroutine on it.
     private var receiveThread: Thread? = null
@@ -134,19 +164,17 @@ class RTLTCPClient(
             socket!!.keepAlive = true
             inputStream = DataInputStream(socket!!.getInputStream())
             outputStream = DataOutputStream(socket!!.getOutputStream())
-            val magic = ByteArray(4)
-            inputStream!!.readFully(magic)
-            val magicStr = String(magic, Charsets.UTF_8)
-            if (magicStr != "RTL0") {
-                throw IOException("Invalid server response")
-            }
-            val tunerType = Integer.reverseBytes(inputStream!!.readInt())
-            val tunerGainCount = Integer.reverseBytes(inputStream!!.readInt())
-            Log.i("RTLTCPClient", "Connected - Tuner type: $tunerType, Gain count: $tunerGainCount")
+            val header = readRtlTcpHeader(inputStream!!)
+            tunerMetadata = rtlTcpTunerInfo(header.tunerType, header.tunerGainCount)
+            Log.i(
+                "RTLTCPClient",
+                "Connected - Tuner type: ${header.tunerType}, " +
+                    "Gain count: ${header.tunerGainCount}",
+            )
             isConnected = true
             fftProcessor = FFTProcessor(800)
             spectrumWorker = SpectrumWorker(fftProcessor!!)
-            onConnectionStatusChanged(true, "Connected")
+            onConnectionStatusChanged(true, "Connected - ${tunerMetadata.tunerName}")
             startReceiving()
             true
         } catch (e: Exception) {
@@ -297,27 +325,34 @@ class RTLTCPClient(
         }
     }
 
+    @Synchronized
     fun sendCommand(command: RTLCommand) {
-        scope.launch {
-            try {
-                if (isConnected && outputStream != null) {
-                    val buffer = ByteBuffer.allocate(5)
-                    buffer.order(ByteOrder.BIG_ENDIAN)
-                    buffer.put(command.cmd)
-                    buffer.putInt(command.param)
-                    outputStream!!.write(buffer.array())
-                    outputStream!!.flush()
-                    Log.d("RTLTCPClient", "Sent command: 0x${String.format("%02x", command.cmd)} param: ${command.param}")
-                }
-            } catch (e: Exception) {
-                Log.e("RTLTCPClient", "Failed to send command: ${e.message}")
-            }
+        check(isConnected) { "rtl_tcp control transport is not connected" }
+        val output = outputStream
+            ?: throw IllegalStateException("rtl_tcp control stream is unavailable")
+        val buffer = ByteBuffer.allocate(5).order(ByteOrder.BIG_ENDIAN)
+        buffer.put(command.cmd)
+        buffer.putInt(command.param)
+        try {
+            output.write(buffer.array())
+            output.flush()
+        } catch (failure: Exception) {
+            Log.e("RTLTCPClient", "Failed to send command: ${failure.message}")
+            failLink()
+            throw failure
         }
+        Log.d(
+            "RTLTCPClient",
+            "Sent command: 0x${String.format("%02x", command.cmd)} param: ${command.param}",
+        )
     }
 
     override fun setFrequency(hz: Long) {
-        spectrumWorker?.resetSmoothing()
+        require(hz in 500_000L..1_766_000_000L) {
+            "rtl_tcp frequency $hz Hz is outside 500000..1766000000 Hz"
+        }
         sendCommand(RTLCommand(0x01.toByte(), hz.toInt()))
+        spectrumWorker?.resetSmoothing()
         freqHz = hz
     }
 
@@ -331,9 +366,12 @@ class RTLTCPClient(
     override fun sampleRateHz(): Int = sampleRate.toInt()
 
     override fun setSampleRate(hz: Int) {
+        require(hz in SUPPORTED_SAMPLE_RATES) {
+            "rtl_tcp sample rate $hz is not an exact supported choice"
+        }
+        sendCommand(RTLCommand(0x02.toByte(), hz))
         sampleRate = hz.toDouble()
         spectrumWorker?.resetSmoothing()
-        sendCommand(RTLCommand(0x02.toByte(), hz))
     }
 
     fun setGainMode(manual: Boolean) {
@@ -341,10 +379,22 @@ class RTLTCPClient(
     }
 
     fun setGain(gainTenthsOfDb: Int) {
+        val metadata = tunerMetadata
+        require(metadata.gainTableKnown) {
+            "rtl_tcp server did not provide a verifiable tuner gain table"
+        }
+        require(gainTenthsOfDb in metadata.gainsTenthsDb) {
+            "rtl_tcp tuner does not advertise exact gain $gainTenthsOfDb"
+        }
         sendCommand(RTLCommand(0x04.toByte(), gainTenthsOfDb))
     }
 
+    fun tunerInfo(): RtlTunerInfo = tunerMetadata.copy(
+        gainsTenthsDb = tunerMetadata.gainsTenthsDb.toList(),
+    )
+
     fun setFrequencyCorrection(ppm: Int) {
+        require(ppm in -488..488) { "rtl_tcp correction $ppm ppm is outside -488..488" }
         sendCommand(RTLCommand(0x05.toByte(), ppm))
     }
 
@@ -357,6 +407,7 @@ class RTLTCPClient(
     }
 
     fun setDirectSampling(mode: Int) {
+        require(mode in 0..2) { "rtl_tcp direct-sampling mode $mode is outside 0..2" }
         sendCommand(RTLCommand(0x09.toByte(), mode))
     }
 

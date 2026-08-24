@@ -52,6 +52,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import java.io.IOException
 import java.util.concurrent.Executors
 import kotlin.coroutines.resume
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -79,6 +80,14 @@ data class RTLCommand(val cmd: Byte, val param: Int) {
         fun SetBiasTee(enabled: Boolean) = RTLCommand(CMD_SET_BIAS_TEE, if (enabled) 1 else 0)
     }
 }
+
+internal fun rtlUsbSampleRateError(hz: Int): String? =
+    if (SDRConfig.SAMPLE_RATES.any { it.first == hz }) null
+    else "RTL-USB sample rate $hz is not an exact supported choice"
+
+internal fun rtlUsbGainError(exactGains: IntArray, gainTenthsOfDb: Int): String? =
+    if (exactGains.any { it == gainTenthsOfDb }) null
+    else "RTL-USB tuner does not advertise exact gain $gainTenthsOfDb"
 
 /**
  * RTL2832U USB driver.
@@ -377,45 +386,73 @@ class RTLUSBClient(
     }
 
     /**
-     * Queues an rtl_tcp style command; executed on the USB dispatcher without
-     * interrupting the IQ stream.
+     * Execute one control on the serialized USB dispatcher and return only at
+     * its hardware terminal boundary. DriverSession cannot acknowledge an
+     * operation that is merely queued or that disappeared during teardown.
      */
     fun sendCommand(command: RTLCommand) {
-        if (!isOpen) return
+        check(isOpen && !devLost) { "RTL-USB control transport is not open" }
 
         if (command.cmd == RTLCommand.CMD_SET_FREQUENCY) {
             latestRequestedFreq = command.param.toLong() and 0xffffffffL
         }
 
-        scope.launch {
-            if (!isOpen || devLost) return@launch
-            try {
-                executeCommand(command)
-                // The state changed NOW, not when the command was queued:
-                // tell the host so its EV_SAMPLE_RATE / EV_FREQUENCY carry
-                // the rate and frequency in force after this command.
-                if (command.cmd == RTLCommand.CMD_SET_SAMPLE_RATE ||
-                    command.cmd == RTLCommand.CMD_SET_FREQUENCY
-                ) {
-                    stateListener?.invoke()
+        try {
+            runBlocking(usbDispatcher) {
+                check(isOpen && !devLost) { "RTL-USB control transport closed before apply" }
+                val result = executeCommand(command)
+                if (result != 0) {
+                    throw IOException(
+                        "RTL-USB command 0x${command.cmd.toString(16)} failed with $result",
+                    )
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Command 0x${command.cmd.toString(16)} failed", e)
             }
+        } catch (failure: Exception) {
+            Log.e(TAG, "Command 0x${command.cmd.toString(16)} failed", failure)
+            throw failure
+        }
+        // The state changed NOW, not when the command was queued: tell the
+        // host so EV_SAMPLE_RATE / EV_FREQUENCY carry the state in force.
+        if (command.cmd == RTLCommand.CMD_SET_SAMPLE_RATE ||
+            command.cmd == RTLCommand.CMD_SET_FREQUENCY
+        ) {
+            stateListener?.invoke()
         }
     }
 
-    override fun setFrequency(hz: Long) = sendCommand(RTLCommand.SetFrequency(hz))
+    override fun setFrequency(hz: Long) {
+        require(hz in 500_000L..1_766_000_000L) {
+            "RTL-USB frequency $hz Hz is outside 500000..1766000000 Hz"
+        }
+        sendCommand(RTLCommand.SetFrequency(hz))
+    }
 
     /**
      * The contract's rate setter. The tuner routine of the same name is a
      * private port detail; the host asks through the command queue, which is
      * how every other parameter reaches this radio.
      */
-    override fun setSampleRate(hz: Int) = sendCommand(RTLCommand.SetSampleRate(hz.toLong()))
+    override fun setSampleRate(hz: Int) {
+        rtlUsbSampleRateError(hz)?.let { throw IllegalArgumentException(it) }
+        sendCommand(RTLCommand.SetSampleRate(hz.toLong()))
+    }
     fun setGainMode(manual: Boolean) = sendCommand(RTLCommand.SetGainMode(manual))
-    fun setGain(gainTenthsOfDb: Int) = sendCommand(RTLCommand.SetGain(gainTenthsOfDb))
-    fun setDirectSamplingMode(mode: Int) = sendCommand(RTLCommand(RTLCommand.CMD_SET_DIRECT_SAMPLING, mode))
+    fun setGain(gainTenthsOfDb: Int) {
+        val info = tunerInfo()
+        require(info.gainTableKnown) { "RTL-USB tuner gain table is unavailable" }
+        rtlUsbGainError(info.gainsTenthsDb.toIntArray(), gainTenthsOfDb)?.let {
+            throw IllegalArgumentException("$it (${tunerType.name})")
+        }
+        sendCommand(RTLCommand.SetGain(gainTenthsOfDb))
+    }
+    fun setFrequencyCorrection(ppm: Int) {
+        require(ppm in -488..488) { "RTL-USB correction $ppm ppm is outside -488..488" }
+        sendCommand(RTLCommand.SetPPMCorrection(ppm))
+    }
+    fun setDirectSamplingMode(mode: Int) {
+        require(mode in 0..2) { "RTL-USB direct-sampling mode $mode is outside 0..2" }
+        sendCommand(RTLCommand(RTLCommand.CMD_SET_DIRECT_SAMPLING, mode))
+    }
 
     override fun frequencyHz(): Long = freq
 
@@ -434,7 +471,18 @@ class RTLUSBClient(
     fun getDirectSampling(): Int = directSampling
 
     /** All gain values are expressed in tenths of a dB (rtlsdr_get_tuner_gains). */
-    fun getTunerGains(): IntArray = tuner?.gains ?: intArrayOf(0)
+    fun getTunerGains(): IntArray = tunerInfo().gainsTenthsDb.toIntArray()
+
+    /** Exact detected tuner metadata; no tuner means unknown, never `[0]`. */
+    fun tunerInfo(): RtlTunerInfo {
+        val active = tuner ?: return RtlTunerInfo.unknown(tunerType.ordinal)
+        return RtlTunerInfo(
+            tunerType = tunerType.ordinal,
+            tunerName = active.name,
+            gainTableKnown = true,
+            gainsTenthsDb = active.gains.toList(),
+        )
+    }
 
     fun setSmoothingFactor(alpha: Float) {
         fftProcessor?.setSmoothingFactor(alpha)
@@ -449,18 +497,21 @@ class RTLUSBClient(
 
     // ==================== Command execution (USB dispatcher only) ====================
 
-    private fun executeCommand(command: RTLCommand) {
+    private fun executeCommand(command: RTLCommand): Int =
         when (command.cmd) {
             RTLCommand.CMD_SET_FREQUENCY -> {
                 val requested = command.param.toLong() and 0xffffffffL
-                /* skip stale tuning requests that were superseded meanwhile */
-                if (requested != latestRequestedFreq) return
-                fftProcessor?.resetSmoothing()
-                setCenterFreq(requested)
+                if (requested != latestRequestedFreq) {
+                    throw IllegalStateException("RTL-USB frequency request was superseded")
+                }
+                setCenterFreq(requested).also {
+                    if (it == 0) fftProcessor?.resetSmoothing()
+                }
             }
             RTLCommand.CMD_SET_SAMPLE_RATE -> {
-                fftProcessor?.resetSmoothing()
-                applyTunerSampleRate(command.param)
+                applyTunerSampleRate(command.param).also {
+                    if (it == 0) fftProcessor?.resetSmoothing()
+                }
             }
             RTLCommand.CMD_SET_GAIN_MODE -> setTunerGainMode(command.param != 0)
             RTLCommand.CMD_SET_GAIN -> setTunerGain(command.param)
@@ -468,9 +519,10 @@ class RTLUSBClient(
             RTLCommand.CMD_SET_AGC -> setAgcMode(command.param != 0)
             RTLCommand.CMD_SET_DIRECT_SAMPLING -> setDirectSampling(command.param)
             RTLCommand.CMD_SET_BIAS_TEE -> setBiasTee(command.param != 0)
-            else -> Log.w(TAG, "Unsupported command 0x${command.cmd.toString(16)}")
+            else -> throw IllegalArgumentException(
+                "Unsupported RTL-USB command 0x${command.cmd.toString(16)}",
+            )
         }
-    }
 
     // ==================== USB permission ====================
 
@@ -1031,6 +1083,10 @@ class RTLUSBClient(
 
     private fun setTunerGain(gainTenthDb: Int): Int {
         val t = tuner ?: return -1
+        if (t.gains.none { it == gainTenthDb }) {
+            Log.e(TAG, "Refusing non-table tuner gain $gainTenthDb")
+            return -1
+        }
         setI2cRepeater(true)
         val r = t.setGain(gainTenthDb)
         gain = if (r == 0) gainTenthDb else 0

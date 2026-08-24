@@ -41,6 +41,7 @@ class Fc2580Tuner(private val ctx: TunerContext) : RtlTuner {
 
     companion object {
         const val FC2580_I2C_ADDR = 0xac
+        internal val GAINS = intArrayOf(0) /* no programmable gain values */
 
         /* 16.384 MHz (at least on the Logilink VG0002A) */
         private const val CRYSTAL_FREQ = 16_384_000L
@@ -56,7 +57,7 @@ class Fc2580Tuner(private val ctx: TunerContext) : RtlTuner {
     }
 
     override val name = "FCI FC2580"
-    override val gains = intArrayOf(0) /* no gain values */
+    override val gains: IntArray get() = GAINS
 
     private fun wr(reg: Int, value: Int): Boolean =
         ctx.i2cWriteReg(FC2580_I2C_ADDR, reg, value and 0xff) >= 0

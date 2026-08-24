@@ -103,7 +103,7 @@ class Fc0013Tuner(private val ctx: TunerContext) : RtlTuner {
         )
         private val GAIN_CNT = LNA_GAINS.size / 2
 
-        private val GAINS = intArrayOf(
+        internal val GAINS = intArrayOf(
             -99, -73, -65, -63, -60, -58, -54, 58, 61,
             63, 65, 67, 68, 70, 71, 179, 181, 182,
             184, 186, 188, 191, 197
