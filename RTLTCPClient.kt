@@ -154,8 +154,11 @@ class RTLTCPClient(
     private var sampleRate: Double = 2.048e6
     @Volatile private var freqHz = 0L
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val teardownLock = Object()
+    @Volatile private var teardownOwner: Thread? = null
 
     override suspend fun connect(): Boolean = withContext(Dispatchers.IO) {
+        teardownDone.set(false)
         try {
             onConnectionStatusChanged(false, "Connecting...")
             socket = Socket(host, port)
@@ -186,7 +189,10 @@ class RTLTCPClient(
     }
 
     override fun disconnect() {
-        scope.launch { teardown("Disconnected") }
+        // teardown() is self-thread safe and closes the socket before joining
+        // the receive loop. RadioClient.disconnect is a terminal boundary:
+        // callers may reuse the physical endpoint immediately after return.
+        teardown("Disconnected")
     }
 
     /**
@@ -202,17 +208,50 @@ class RTLTCPClient(
      * full join timeout on every failed link.
      */
     private fun teardown(statusMessage: String) {
-        if (!teardownDone.compareAndSet(false, true)) return
-        isConnected = false
+        serializedTeardown {
+            val announce = teardownDone.compareAndSet(false, true)
+            isConnected = false
+            val self = Thread.currentThread()
+            // Closing the stream is what unblocks the blocking read.
+            runCatching { inputStream?.close() }
+            runCatching { outputStream?.close() }
+            runCatching { socket?.close() }
+            receiveThread?.takeIf { it !== self }?.let { DspThread.stop(it) }
+            receiveThread = null
+            spectrumWorker?.stop()
+            if (announce) onConnectionStatusChanged(false, statusMessage)
+        }
+    }
+
+    /**
+     * Serialise repeated cleanup without deadlocking the receive thread an
+     * external disconnect is currently joining. A later caller still runs a
+     * full idempotent pass, which closes resources allocated after an earlier
+     * cancellation request.
+     */
+    private fun serializedTeardown(block: () -> Unit) {
         val self = Thread.currentThread()
-        // Closing the stream is what unblocks the blocking read.
-        runCatching { inputStream?.close() }
-        runCatching { outputStream?.close() }
-        runCatching { socket?.close() }
-        receiveThread?.takeIf { it !== self }?.let { DspThread.stop(it) }
-        receiveThread = null
-        spectrumWorker?.stop()
-        onConnectionStatusChanged(false, statusMessage)
+        var interrupted = false
+        synchronized(teardownLock) {
+            while (teardownOwner != null) {
+                if (teardownOwner === self || receiveThread === self) return
+                try {
+                    teardownLock.wait()
+                } catch (_: InterruptedException) {
+                    interrupted = true
+                }
+            }
+            teardownOwner = self
+        }
+        try {
+            block()
+        } finally {
+            synchronized(teardownLock) {
+                teardownOwner = null
+                teardownLock.notifyAll()
+            }
+            if (interrupted) self.interrupt()
+        }
     }
 
     /**
@@ -232,7 +271,6 @@ class RTLTCPClient(
     }
 
     private fun startReceiving() {
-        teardownDone.set(false)
         // Audio priority: this loop feeds the audio pipeline and must not
         // lose CPU to spectrum/waterfall rendering on a low-end phone.
         receiveThread = DspThread.start("rtltcp-rx", DspThread.PRIORITY_RADIO, onFailure = { failLink() }) {

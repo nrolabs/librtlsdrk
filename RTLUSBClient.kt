@@ -53,7 +53,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import java.io.IOException
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlinx.coroutines.suspendCancellableCoroutine
 
@@ -261,11 +263,18 @@ class RTLUSBClient(
     private val fir = FIR_DEFAULT.clone()
 
     /** All control transfers are funneled through this single-threaded dispatcher. */
+    @Volatile private var usbThread: Thread? = null
     private val usbExecutor = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "rtlsdr-usb").apply { priority = Thread.NORM_PRIORITY + 1 }
+        Thread(r, "rtlsdr-usb").apply {
+            priority = Thread.NORM_PRIORITY + 1
+            usbThread = this
+        }
     }
     private val usbDispatcher = usbExecutor.asCoroutineDispatcher()
     private val scope = CoroutineScope(SupervisorJob() + usbDispatcher)
+    private val teardownStarted = AtomicBoolean(false)
+    private val teardownFinished = CountDownLatch(1)
+    @Volatile private var teardownOwner: Thread? = null
 
     // Bulk-read loop on a dedicated thread (see DspThread).
     private var streamThread: Thread? = null
@@ -328,23 +337,30 @@ class RTLUSBClient(
                 return@withContext false
             }
 
-            usbDevice = device
-            registerDetachReceiver(device)
             onConnectionStatusChanged(false, "Opening device...")
 
-            val opened = withContext(usbDispatcher) { open() }
+            val opened = withContext(usbDispatcher) {
+                if (released || teardownStarted.get()) return@withContext false
+                usbDevice = device
+                registerDetachReceiver(device)
+                open()
+            }
             if (!opened) {
                 onConnectionStatusChanged(false, "Failed to open device")
-                release()
+                teardownBlocking(null)
                 return@withContext false
             }
 
-            withContext(usbDispatcher) { applyStreamingDefaults() }
-
-            fftProcessor = FFTProcessor(SDRConfig.FFT_SIZE)
-            zoomed = ZoomedSpectrum(fftProcessor!!)
-            isConnected = true
-            startStreaming()
+            val started = withContext(usbDispatcher) {
+                if (released || teardownStarted.get()) return@withContext false
+                applyStreamingDefaults()
+                fftProcessor = FFTProcessor(SDRConfig.FFT_SIZE)
+                zoomed = ZoomedSpectrum(fftProcessor!!)
+                isConnected = true
+                startStreaming()
+                true
+            }
+            if (!started) return@withContext false
 
             onConnectionStatusChanged(true, "Connected - Tuner: ${tunerType.name}")
             true
@@ -359,14 +375,35 @@ class RTLUSBClient(
     override fun disconnect() {
         isConnected = false
         if (released) return
-        scope.launch {
+        teardownBlocking("Disconnected")
+    }
+
+    /** Terminal, idempotent implementation of RadioClient.disconnect(). */
+    private fun teardownBlocking(status: String?) {
+        if (teardownStarted.compareAndSet(false, true)) {
+            teardownOwner = Thread.currentThread()
             try {
-                close()
-                onConnectionStatusChanged(false, "Disconnected")
+                if (Thread.currentThread() === usbThread) {
+                    close()
+                } else {
+                    runBlocking(usbDispatcher) { close() }
+                }
+                status?.let { onConnectionStatusChanged(false, it) }
             } catch (e: Exception) {
                 Log.e(TAG, "Error during disconnect", e)
             } finally {
                 release()
+                teardownOwner = null
+                teardownFinished.countDown()
+            }
+        } else if (
+            Thread.currentThread() !== usbThread &&
+            Thread.currentThread() !== teardownOwner
+        ) {
+            try {
+                teardownFinished.await()
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
             }
         }
     }
@@ -1282,7 +1319,7 @@ class RTLUSBClient(
         // guards a second run, and it is what shuts the USB executor down, so
         // this must not be posted through the (already cancelled) scope after
         // it has run.
-        if (!released) scope.launch { try { close() } finally { release() } }
+        if (!released) scope.launch { teardownBlocking(null) }
     }
 
     private fun startProcessor() {
@@ -1373,13 +1410,7 @@ class RTLUSBClient(
             /* Unplugged mid-stream: free the interface, fd and worker thread. */
             if (devLost) {
                 isConnected = false
-                scope.launch {
-                    try {
-                        close()
-                    } finally {
-                        release()
-                    }
-                }
+                scope.launch { teardownBlocking(null) }
             }
         }
     }
